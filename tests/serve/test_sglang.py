@@ -106,9 +106,12 @@ sglang_configs = {
         script_name="disagg_same_gpu.sh",
         marks=[
             pytest.mark.gpu_1,
+            pytest.mark.profiled_vram_gib(9.9),  # actual profiled peak with kv-tokens
+            pytest.mark.requested_sglang_kv_tokens(
+                37472
+            ),  # KV cache cap (2x safety over min=18736)
+            pytest.mark.timeout(282),  # ~6x observed 47s
             pytest.mark.pre_merge,
-            pytest.mark.skip(reason="unstable"),
-            # TODO: profile to get max_vram and timeout (currently skipped)
         ],
         model="Qwen/Qwen3-0.6B",
         delayed_start=30,
@@ -117,18 +120,16 @@ sglang_configs = {
         request_payloads=[
             chat_payload_default(),
             completion_payload_default(),
-            # Validate dynamo_component_* and sglang:* metrics from prefill worker
-            # (DefaultPort.SYSTEM1)
+            # Disagg workers expose fewer sglang:* metrics (~14 vs ~25 for aggregated)
+            # because each only runs half the scheduler pipeline.
             metric_payload_default(
                 min_num_requests=6,
-                backend="sglang",
+                backend="sglang_disagg",
                 port=DefaultPort.SYSTEM1.value,
             ),
-            # Validate dynamo_component_* and sglang:* metrics from decode worker
-            # (DefaultPort.SYSTEM2)
             metric_payload_default(
                 min_num_requests=6,
-                backend="sglang",
+                backend="sglang_disagg",
                 port=DefaultPort.SYSTEM2.value,
             ),
         ],

@@ -72,8 +72,8 @@ python3 -m dynamo.sglang \
 # Wait for prefill worker to initialize before starting decode worker.
 # Both workers share one GPU with --delete-ckpt-after-loading; without this
 # wait they compete for GPU memory during model loading and the scheduler OOMs.
-echo "Waiting for prefill worker to initialize..."
-sleep 10
+PREFILL_SYSTEM_PORT="${DYN_SYSTEM_PORT1:-8081}"
+wait_for_ready "http://localhost:${PREFILL_SYSTEM_PORT}/health" 45
 
 # run decode worker with metrics on port 8082
 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \

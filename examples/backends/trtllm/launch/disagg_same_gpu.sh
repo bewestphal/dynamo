@@ -113,8 +113,10 @@ python3 -m dynamo.trtllm \
 # Wait for prefill worker to load model and allocate KV cache before starting
 # decode.  Both workers share one GPU; without this wait they compete for GPU
 # memory during model loading, which can cause OOM.
-echo "Waiting for prefill worker to initialize..."
-sleep 10
+# TRT-LLM PyTorch backend compilation takes 30-60s, so 120s timeout.
+# || true: don't let set -e kill the script on timeout (wait_for_ready returns 1).
+PREFILL_SYSTEM_PORT="${DYN_SYSTEM_PORT1:-8081}"
+wait_for_ready "http://localhost:${PREFILL_SYSTEM_PORT}/health" 45 || true
 
 # run decode worker (shares GPU with prefill)
 OTEL_SERVICE_NAME=dynamo-worker-decode \

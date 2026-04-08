@@ -310,10 +310,10 @@ vllm_configs = {
                 1_023_525_000
             ),  # KV cache cap (2x safety over min=511_762_432)
             pytest.mark.timeout(300),  # ~6x observed 50s
-            pytest.mark.post_merge,
+            pytest.mark.pre_merge,
         ],
         model="Qwen/Qwen3-0.6B",
-        delayed_start=30,
+        delayed_start=10,  # seconds to wait before polling worker health
         request_payloads=[
             chat_payload_default(),
             completion_payload_default(),

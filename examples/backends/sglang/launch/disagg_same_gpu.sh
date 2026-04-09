@@ -74,7 +74,7 @@ python3 -m dynamo.sglang \
 # wait they compete for GPU memory during model loading and the scheduler OOMs.
 # || true: don't let set -e kill the script on timeout (wait_for_ready returns 1).
 PREFILL_SYSTEM_PORT="${DYN_SYSTEM_PORT1:-8081}"
-wait_for_ready "http://localhost:${PREFILL_SYSTEM_PORT}/health" 45 || true
+wait_for_ready "http://localhost:${PREFILL_SYSTEM_PORT}/health" 120 || true
 
 # run decode worker with metrics on port 8082
 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \

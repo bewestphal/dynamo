@@ -317,7 +317,9 @@ vllm_configs = {
                 1_023_525_000
             ),  # KV cache cap (2x safety over min=511_762_432)
             pytest.mark.timeout(300),  # ~6x observed 50s
-            pytest.mark.pre_merge,
+            # post_merge: cumulative sequential test time exceeds 35-min job budget.
+            # Move back to pre_merge once GPU tests run in parallel.
+            pytest.mark.post_merge,
         ],
         model="Qwen/Qwen3-0.6B",
         delayed_start=10,

@@ -45,6 +45,15 @@ use dynamo_kv_router::protocols::{
 use dynamo_tokens::blocks::UniqueBlock;
 use dynamo_tokens::{BlockHash, SequenceHash};
 use rustc_hash::FxHashMap;
+#[cfg(feature = "kvbm")]
+use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "kvbm")]
+use std::sync::Arc;
+
+#[cfg(feature = "kvbm")]
+use crate::kv_manager::kvbm_offload::MockOffloadEngine;
+#[cfg(feature = "kvbm")]
+use kvbm_engine::BlockId;
 
 pub struct KvManager {
     cache: HashCache,
@@ -52,6 +61,14 @@ pub struct KvManager {
     kv_event_publishers: KvEventPublishers,
     dp_rank: u32,
     next_event_id: u64,
+    /// Maps UniqueBlock → physical slot ID for kvbm-engine block tracking.
+    #[cfg(feature = "kvbm")]
+    block_id_map: HashMap<UniqueBlock, BlockId>,
+    /// Free physical slot IDs returned on eviction/destruction.
+    #[cfg(feature = "kvbm")]
+    block_id_pool: VecDeque<BlockId>,
+    #[cfg(feature = "kvbm")]
+    offload_engine: Option<Arc<MockOffloadEngine>>,
 }
 
 impl KvManager {
@@ -78,7 +95,42 @@ impl KvManager {
             kv_event_publishers,
             dp_rank,
             next_event_id: 0,
+            #[cfg(feature = "kvbm")]
+            block_id_map: HashMap::new(),
+            #[cfg(feature = "kvbm")]
+            block_id_pool: (0..max_capacity as BlockId).collect(),
+            #[cfg(feature = "kvbm")]
+            offload_engine: None,
         }
+    }
+
+    /// Attach a KVBM offload engine to enable G1→G2→G3 block offloading.
+    #[cfg(feature = "kvbm")]
+    pub fn set_offload_engine(&mut self, engine: Arc<MockOffloadEngine>) {
+        self.offload_engine = Some(engine);
+    }
+
+    /// Allocate a physical slot ID for a newly inserted G1 block.
+    #[cfg(feature = "kvbm")]
+    fn assign_block_id(&mut self, block: &UniqueBlock) {
+        if let Some(id) = self.block_id_pool.pop_front() {
+            self.block_id_map.insert(block.clone(), id);
+        } else {
+            tracing::warn!("block_id_pool exhausted — no slot ID assigned for {block:?}");
+        }
+    }
+
+    /// Release a physical slot ID back to the pool and return (block_id, seq_hash)
+    /// for the evicted block.
+    #[cfg(feature = "kvbm")]
+    fn release_block_id(&mut self, block: &UniqueBlock) -> Option<(BlockId, SequenceHash)> {
+        if let Some(id) = self.block_id_map.remove(block) {
+            self.block_id_pool.push_back(id);
+            if let UniqueBlock::FullBlock(seq_hash) = block {
+                return Some((id, *seq_hash));
+            }
+        }
+        None
     }
 
     /// Converts stored/removed blocks into KvCacheEventData and publishes if sink is available.
@@ -165,13 +217,14 @@ impl KvManager {
                 let mut blocks_stored = Vec::<u64>::new();
                 let mut stored_token_ids: Option<Vec<Vec<u32>>> =
                     token_ids.as_ref().map(|_| Vec::new());
+                #[cfg(feature = "kvbm")]
+                let kvbm_engine = self.offload_engine.clone();
 
                 let mut parent_block: Option<&UniqueBlock> = parent.as_ref();
                 let mut allocated = 0;
                 for (i, hash) in hashes.iter().enumerate() {
                     // First check if it already exists in active blocks
                     if self.cache.contains_active(hash) {
-                        // Block already active, just increment reference count
                         self.cache.increment_ref(hash);
                         parent_block = Some(hash);
                         allocated += 1;
@@ -185,6 +238,46 @@ impl KvManager {
                         continue;
                     }
 
+                    // Check G2/G3 tiers before evicting (KVBM onboard path).
+                    #[cfg(feature = "kvbm")]
+                    if let Some(ref engine) = kvbm_engine {
+                        if let UniqueBlock::FullBlock(seq_hash) = hash {
+                            if engine.find_in_tiers(*seq_hash) {
+                                // Simulate G2→G1 transfer delay before using the block.
+                                engine.onboard_g2_to_g1(1);
+                                // Evict G1 if at capacity before inserting onboarded block.
+                                if self.cache.is_at_capacity() {
+                                    let Some(evicted) = self.cache.evict_inactive() else {
+                                        break;
+                                    };
+                                    if let UniqueBlock::FullBlock(eh) = &evicted {
+                                        self.publish_kv_event(vec![*eh], &[], None, false, None);
+                                    }
+                                    if let Some((bid, sh)) = self.release_block_id(&evicted) {
+                                        engine.enqueue_g1_eviction(bid, sh);
+                                    }
+                                }
+                                self.cache.insert_active(hash.clone(), 1);
+                                self.assign_block_id(hash);
+                                allocated += 1;
+                                // Publish KV store event only when sequence parent is in G1.
+                                // If parent was also evicted to G2, router's radix tree would
+                                // reject the store (broken parent chain).
+                                let prev_parent = parent_block;
+                                parent_block = Some(hash);
+                                let parent_in_g1 =
+                                    prev_parent.map(|p| self.cache.contains(p)).unwrap_or(false);
+                                if parent_in_g1 {
+                                    blocks_stored.push(*seq_hash);
+                                    if let Some(ref mut stids) = stored_token_ids {
+                                        stids.push(token_ids.as_ref().unwrap()[i].clone());
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // If at max capacity, evict the oldest entry from inactive blocks
                     if self.cache.is_at_capacity() {
                         let Some(evicted) = self.cache.evict_inactive() else {
@@ -194,14 +287,31 @@ impl KvManager {
                             "Evicting block from inactive pool: {evicted:?}, dp_rank={}",
                             self.dp_rank
                         );
-                        if let UniqueBlock::FullBlock(evicted_full_block) = evicted {
-                            self.publish_kv_event(vec![evicted_full_block], &[], None, false, None);
+                        if let UniqueBlock::FullBlock(evicted_full_block) = &evicted {
+                            self.publish_kv_event(
+                                vec![*evicted_full_block],
+                                &[],
+                                None,
+                                false,
+                                None,
+                            );
+                        }
+                        // Enqueue evicted block for G2 offload if KVBM is enabled.
+                        #[cfg(feature = "kvbm")]
+                        if let Some(ref engine) = kvbm_engine {
+                            if let Some((block_id, seq_hash)) = self.release_block_id(&evicted) {
+                                engine.enqueue_g1_eviction(block_id, seq_hash);
+                            }
                         }
                     }
 
                     // Now insert the new block in active blocks with reference count 1
                     self.cache.insert_active(hash.clone(), 1);
                     allocated += 1;
+                    #[cfg(feature = "kvbm")]
+                    if kvbm_engine.is_some() {
+                        self.assign_block_id(hash);
+                    }
                     // Track blocks for trace/event
                     if let UniqueBlock::FullBlock(stored_full_block) = hash {
                         blocks_stored.push(*stored_full_block);
@@ -228,12 +338,14 @@ impl KvManager {
 
             MoveBlock::Destroy(hashes) => {
                 let mut blocks_destroyed = Vec::<u64>::new();
-                // Process blocks in order (already reversed by caller if needed)
                 for hash in hashes.iter() {
                     self.cache.remove_active(hash).unwrap();
-                    // Track blocks for batch sending
                     if let UniqueBlock::FullBlock(destroyed_full_block) = hash {
                         blocks_destroyed.push(*destroyed_full_block);
+                    }
+                    #[cfg(feature = "kvbm")]
+                    if self.offload_engine.is_some() {
+                        self.release_block_id(hash);
                     }
                 }
 
@@ -278,7 +390,20 @@ impl KvManager {
                 };
 
                 self.cache
-                    .insert_active(hash_block, hash_ref_count.unwrap_or(0) + 1);
+                    .insert_active(hash_block.clone(), hash_ref_count.unwrap_or(0) + 1);
+
+                // Transfer KVBM slot ID: PartialBlock → FullBlock.
+                #[cfg(feature = "kvbm")]
+                if self.offload_engine.is_some() {
+                    if let Some(slot_id) = self.block_id_map.remove(&uuid_block) {
+                        if is_new {
+                            self.block_id_map.insert(hash_block, slot_id);
+                        } else {
+                            // Cache hit: FullBlock already tracked; return slot to pool.
+                            self.block_id_pool.push_back(slot_id);
+                        }
+                    }
+                }
 
                 if is_new {
                     self.publish_kv_event(

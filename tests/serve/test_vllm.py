@@ -306,6 +306,26 @@ vllm_configs = {
             completion_payload_default(),
         ],
     ),
+    "disaggregated_same_gpu": VLLMConfig(
+        name="disaggregated_same_gpu",
+        directory=vllm_dir,
+        script_name="disagg_same_gpu.sh",
+        marks=[
+            pytest.mark.gpu_1,
+            pytest.mark.profiled_vram_gib(7.3),  # actual profiled peak with kv-bytes
+            pytest.mark.requested_vllm_kv_cache_bytes(
+                1_023_525_000
+            ),  # KV cache cap (2x safety over min=511_762_432)
+            pytest.mark.timeout(300),  # ~6x observed 50s
+            pytest.mark.pre_merge,
+        ],
+        model="Qwen/Qwen3-0.6B",
+        delayed_start=10,  # seconds to wait before polling worker health
+        request_payloads=[
+            chat_payload_default(),
+            completion_payload_default(),
+        ],
+    ),
     "deepep": VLLMConfig(
         name="deepep",
         directory=vllm_dir,

@@ -16,6 +16,7 @@ from tests.utils.payloads import BasePayload, check_health_generate, check_model
 
 logger = logging.getLogger(__name__)
 
+
 FRONTEND_PORT = (
     DefaultPort.FRONTEND.value
 )  # Do NOT use this in tests! Use allocate_port() instead.
@@ -169,6 +170,39 @@ class EngineProcess(ManagedProcess):
         if extra_env:
             env.update(extra_env)
 
+        frontend_checks = [
+            (
+                f"http://localhost:{config.frontend_port}/v1/models",
+                check_models_api,
+            ),
+            (
+                f"http://localhost:{config.frontend_port}/health",
+                check_health_generate,
+            ),
+        ]
+
+        # For disagg-same-gpu deployments (delayed_start > 0), also
+        # health-check each worker's system port so we wait for ALL workers
+        # to be ready, not just the first one to register with the frontend.
+        # Worker liveness checks run FIRST so the frontend has time to discover
+        # newly-registered workers before the frontend endpoint checks run.
+        #
+        # NOTE: The delayed_start > 0 gate is intentional — DYN_SYSTEM_PORT*
+        # env vars are injected by the dynamic port fixtures for ALL tests,
+        # but only same-gpu disagg tests (which set delayed_start) actually
+        # need per-worker health checks.  Regular multi-GPU disagg tests
+        # rely solely on the frontend health check.
+        delayed = config.delayed_start
+        worker_checks: list[tuple] = []
+        if delayed > 0:
+            for key, val in sorted(env.items()):
+                if key.startswith("DYN_SYSTEM_PORT") and val.isdigit():
+                    worker_checks.append((f"http://localhost:{val}/health", None))
+            if worker_checks:
+                delayed = 0
+
+        health_urls = worker_checks + frontend_checks
+
         return cls(
             command=command,
             env=env,
@@ -176,17 +210,8 @@ class EngineProcess(ManagedProcess):
             display_output=True,
             working_dir=config.directory,
             health_check_ports=[],
-            health_check_urls=[
-                (
-                    f"http://localhost:{config.frontend_port}/v1/models",
-                    check_models_api,
-                ),
-                (
-                    f"http://localhost:{config.frontend_port}/health",
-                    check_health_generate,
-                ),
-            ],
-            delayed_start=config.delayed_start,
+            health_check_urls=health_urls,
+            delayed_start=delayed,
             # Must stay False: command[0] is "bash", so True would kill every
             # bash process system-wide.  Stale cleanup relies on stragglers list
             # and process-group termination in __exit__ instead.

@@ -116,7 +116,8 @@ sglang_configs = {
             pytest.mark.pre_merge,
         ],
         model="Qwen/Qwen3-0.6B",
-        delayed_start=10,  # seconds to wait before polling worker health
+        delayed_start=10,
+        health_check_workers=True,
         env={},
         frontend_port=DefaultPort.FRONTEND.value,
         request_payloads=[

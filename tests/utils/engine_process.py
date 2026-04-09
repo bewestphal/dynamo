@@ -50,6 +50,7 @@ class EngineConfig:
     frontend_port: int = DefaultPort.FRONTEND.value
     timeout: int = 600
     delayed_start: int = 0
+    health_check_workers: bool = False
     env: Dict[str, str] = field(default_factory=dict)
     stragglers: list[str] = field(default_factory=list)
 
@@ -181,20 +182,19 @@ class EngineProcess(ManagedProcess):
             ),
         ]
 
-        # For disagg-same-gpu deployments (delayed_start > 0), also
-        # health-check each worker's system port so we wait for ALL workers
-        # to be ready, not just the first one to register with the frontend.
-        # Worker liveness checks run FIRST so the frontend has time to discover
-        # newly-registered workers before the frontend endpoint checks run.
+        # For disagg-same-gpu deployments, health-check each worker's
+        # system port so we wait for ALL workers to be ready, not just the
+        # first one to register with the frontend.  Worker liveness checks
+        # run FIRST so the frontend has time to discover newly-registered
+        # workers before the frontend endpoint checks run.
         #
-        # NOTE: The delayed_start > 0 gate is intentional — DYN_SYSTEM_PORT*
-        # env vars are injected by the dynamic port fixtures for ALL tests,
-        # but only same-gpu disagg tests (which set delayed_start) actually
-        # need per-worker health checks.  Regular multi-GPU disagg tests
-        # rely solely on the frontend health check.
+        # NOTE: DYN_SYSTEM_PORT* env vars are injected by the dynamic port
+        # fixtures for ALL tests, so we gate on health_check_workers (only
+        # set by same-gpu disagg configs) to avoid health-checking ports
+        # that don't serve /health in regular multi-GPU tests.
         delayed = config.delayed_start
         worker_checks: list[tuple] = []
-        if delayed > 0:
+        if config.health_check_workers:
             for key, val in sorted(env.items()):
                 if key.startswith("DYN_SYSTEM_PORT") and val.isdigit():
                     worker_checks.append((f"http://localhost:{val}/health", None))

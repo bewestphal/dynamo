@@ -320,7 +320,8 @@ vllm_configs = {
             pytest.mark.pre_merge,
         ],
         model="Qwen/Qwen3-0.6B",
-        delayed_start=10,  # seconds to wait before polling worker health
+        delayed_start=10,
+        health_check_workers=True,
         request_payloads=[
             chat_payload_default(),
             completion_payload_default(),

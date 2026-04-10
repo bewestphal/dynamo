@@ -32,6 +32,11 @@ from tests.utils.payload_builder import (
 logger = logging.getLogger(__name__)
 
 
+def _is_cuda13() -> bool:
+    v = os.environ.get("CUDA_VERSION", "")
+    return v.startswith("13")
+
+
 @dataclass
 class SGLangConfig(EngineConfig):
     """Configuration for SGLang test scenarios"""
@@ -114,6 +119,10 @@ sglang_configs = {
             # "ready" at ~176s on a warm-cache RTX 6000 Ada.
             pytest.mark.timeout(420),
             pytest.mark.pre_merge,
+            pytest.mark.skipif(
+                _is_cuda13(),
+                reason="torch-memory-saver preload .so links libcudart.so.12, missing in cuda13 images",
+            ),
         ],
         model="Qwen/Qwen3-0.6B",
         delayed_start=10,

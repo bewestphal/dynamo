@@ -84,7 +84,16 @@ sglang:
     base_image: nvcr.io/nvidia/cuda-dl-base
     runtime_image: lmsysorg/sglang
     base_image_tag: 25.11-cuda13.0-devel-ubuntu24.04
-    runtime_image_tag: v0.5.10.post1-cu130-runtime
+    # Pinned to a published lmsysorg nightly that bakes in sglang commit
+    # e60c60ef (2026-04-29). Includes:
+    #   - #22239 (mamba tracking off-by-one in spec dec) — fixes Astra qwen
+    #     prd CUDA assert at hybrid_linear_attn_backend.py:268 mamba_track_mask.any()
+    #   - #20739 (hybrid_linear_attn_backend speculative_eagle_topk source cleanup)
+    #   - #24026 (SWA missing mamba_indices in cpu copy interface)
+    # All three landed after the v0.5.10.post1 release tag (2026-04-08), so
+    # they are not in any released sglang. Drop this override and revert to
+    # v0.5.10.post1-cu130-runtime once a released sglang tag (≥ #22239) ships.
+    runtime_image_tag: nightly-dev-cu13-20260430-e60c60ef
   # SGLang uses the NIXL stack from the upstream lmsysorg/sglang runtime image.
   # Do not add nixl_ref here: Dynamo does not build or install its NIXL wheel
   # for SGLang, and SGLang does not use Dynamo KVBM/block-manager at runtime.

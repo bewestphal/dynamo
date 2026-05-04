@@ -21,13 +21,15 @@ navigation:
   - section: Getting Started
     contents:
       - page: Quickstart
-        path: ../pages-dev/getting-started/quickstart.md
+        path: ../pages-dev/getting-started/quickstart.mdx
       - page: Introduction
         path: ../pages-dev/getting-started/introduction.md
       - page: Local Installation
         path: ../pages-dev/getting-started/local-installation.md
       - page: Building from Source
         path: ../pages-dev/getting-started/building-from-source.md
+      - page: Kubernetes Deployment
+        path: ../pages-dev/kubernetes/README.md
       - page: Contribution Guide
         path: ../pages-dev/contribution-guide.md
   # ==================== Resources ====================
@@ -48,6 +50,9 @@ navigation:
     path: ../blogs/index.mdx
     slug: blog
     contents:
+      - page: "Multi-Turn Agentic Harnesses"
+        path: ../blogs/agentic-inference/agentic-harnesses.md
+        slug: agentic-harnesses
       - page: "Full-Stack Optimizations for Agentic Inference"
         path: ../blogs/agentic-inference/agentic-inference.md
         slug: agentic-inference
@@ -139,6 +144,8 @@ navigation:
         slug: agents
         path: ../pages-dev/features/agentic_workloads.md
         contents:
+          - page: Agent Context and Tracing
+            path: ../pages-dev/agents/agent-context.md
           - page: SGLang for Agentic Workloads
             path: ../pages-dev/backends/sglang/agents.md
       - page: Chat Processors
@@ -203,6 +210,8 @@ navigation:
             path: ../pages-dev/backends/sglang/sglang-diffusion.md
           - page: Observability
             path: ../pages-dev/backends/sglang/sglang-observability.md
+          - page: HiCache
+            path: ../pages-dev/backends/sglang/sglang-hicache.md
           - page: Agentic Workloads
             path: ../pages-dev/backends/sglang/agents.md
       - section: TensorRT-LLM
@@ -284,8 +293,6 @@ navigation:
     contents:
       - page: LMCache
         path: ../pages-dev/integrations/lmcache-integration.md
-      - page: SGLang HiCache
-        path: ../pages-dev/backends/sglang/sglang-hicache.md
       - page: FlexKV
         path: ../pages-dev/integrations/flexkv-integration.md
       - page: KV Events for Custom Engines

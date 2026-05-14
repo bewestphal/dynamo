@@ -963,9 +963,11 @@ impl ModelDeploymentCard {
                 let (repo, _) = parse_hf_uri(uri)?;
                 if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
                     let repo_name = e.key().clone();
-                    let snap = crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
-                        .await
-                        .with_context(|| format!("hub::from_hf({repo_name})"))?;
+                    let snap = crate::hub::from_hf_cache_first(
+                        &repo_name, /* ignore_weights = */ true,
+                    )
+                    .await
+                    .with_context(|| format!("hub::from_hf_cache_first({repo_name})"))?;
                     e.insert(snap);
                 }
             }

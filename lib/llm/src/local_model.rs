@@ -384,7 +384,7 @@ impl LocalModel {
     /// will be downloaded.
     /// Returns the path to the model files
     pub async fn fetch(remote_name: &str, ignore_weights: bool) -> anyhow::Result<PathBuf> {
-        super::hub::from_hf(remote_name, ignore_weights).await
+        super::hub::from_hf_cache_first(remote_name, ignore_weights).await
     }
 
     pub fn card(&self) -> &ModelDeploymentCard {

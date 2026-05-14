@@ -166,6 +166,23 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     }
 }
 
+/// Like `from_hf`, but returns the local HF cache snapshot when one is already
+/// present and only falls through to a remote download on cache miss. Use for
+/// callers that would rather serve a possibly-stale local snapshot than block
+/// on a transient remote failure (e.g. frontend model registration).
+pub async fn from_hf_cache_first(
+    name: impl AsRef<Path>,
+    ignore_weights: bool,
+) -> anyhow::Result<PathBuf> {
+    let name = name.as_ref();
+    let model_name = name.display().to_string();
+    if let Some(cached_path) = get_cached_model_path(&model_name, ignore_weights) {
+        tracing::info!("Using cached model '{model_name}' at {cached_path:?}");
+        return Ok(cached_path);
+    }
+    from_hf(name, ignore_weights).await
+}
+
 // Direct download using the ModelExpress client.
 async fn mx_download_direct(model_name: &str, ignore_weights: bool) -> anyhow::Result<PathBuf> {
     let cache_dir = get_model_express_cache_dir();
@@ -236,5 +253,108 @@ mod tests {
             // Clean up
             env::remove_var(env_model::huggingface::HF_HOME);
         }
+    }
+
+    /// Materialize a minimal HF cache snapshot at `cache_root` for `repo_id`,
+    /// optionally including a fake weight file. Local writes only, no network.
+    fn write_fake_snapshot(cache_root: &Path, repo_id: &str, include_weights: bool) -> PathBuf {
+        let folder = format!("models--{}", repo_id.replace('/', "--"));
+        let repo_dir = cache_root.join(&folder);
+        let sha = "deadbeefcafebabe1234567890abcdef12345678";
+        let snapshot_dir = repo_dir.join("snapshots").join(sha);
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs").join("main"), sha).unwrap();
+        std::fs::write(snapshot_dir.join("config.json"), r#"{"model_type":"test"}"#).unwrap();
+        std::fs::write(snapshot_dir.join("tokenizer.json"), "{}").unwrap();
+        if include_weights {
+            std::fs::write(snapshot_dir.join("model.safetensors"), b"fake-weights").unwrap();
+        }
+        snapshot_dir
+    }
+
+    fn force_hf_hub_cache(path: &Path) {
+        unsafe {
+            env::remove_var(env_model::huggingface::HF_HOME);
+            env::remove_var(env_model::model_express::MODEL_EXPRESS_CACHE_PATH);
+            env::set_var(env_model::huggingface::HF_HUB_CACHE, path);
+        }
+    }
+
+    fn clear_hf_hub_cache() {
+        unsafe {
+            env::remove_var(env_model::huggingface::HF_HUB_CACHE);
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn test_get_cached_model_path_finds_populated_snapshot() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let snapshot = write_fake_snapshot(temp.path(), "test-org/test-model", true);
+        force_hf_hub_cache(temp.path());
+
+        let resolved = get_cached_model_path("test-org/test-model", false);
+
+        clear_hf_hub_cache();
+
+        let resolved = resolved.expect("expected cache hit on fully populated snapshot");
+        assert_eq!(resolved, snapshot);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn test_get_cached_model_path_missing_model_returns_none() {
+        let temp = tempfile::TempDir::new().unwrap();
+        force_hf_hub_cache(temp.path());
+
+        let resolved = get_cached_model_path("nonexistent-org/nonexistent-model", false);
+
+        clear_hf_hub_cache();
+
+        assert!(
+            resolved.is_none(),
+            "expected no cache hit when model is absent"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn test_get_cached_model_path_weights_requirement() {
+        // Snapshot has config + tokenizer but no weight files. Required-weights
+        // mode misses; ignore_weights mode hits.
+        let temp = tempfile::TempDir::new().unwrap();
+        write_fake_snapshot(temp.path(), "test-org/tokenizer-only", false);
+        force_hf_hub_cache(temp.path());
+
+        let weights_required = get_cached_model_path("test-org/tokenizer-only", false);
+        let weights_optional = get_cached_model_path("test-org/tokenizer-only", true);
+
+        clear_hf_hub_cache();
+
+        assert!(
+            weights_required.is_none(),
+            "ignore_weights=false should miss when weight files are absent",
+        );
+        assert!(
+            weights_optional.is_some(),
+            "ignore_weights=true should hit on config + tokenizer alone",
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn test_from_hf_cache_first_returns_cached_path_without_network() {
+        // Made-up repo that doesn't exist on HF — Ok result proves cache-first bypassed the network.
+        let temp = tempfile::TempDir::new().unwrap();
+        let snapshot = write_fake_snapshot(temp.path(), "test-org/cache-first-only", true);
+        force_hf_hub_cache(temp.path());
+
+        let resolved = from_hf_cache_first("test-org/cache-first-only", false).await;
+
+        clear_hf_hub_cache();
+
+        let path = resolved.expect("expected cache-first to succeed without network");
+        assert_eq!(path, snapshot);
     }
 }

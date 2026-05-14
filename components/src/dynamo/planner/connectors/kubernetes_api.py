@@ -46,7 +46,66 @@ class KubernetesAPI:
             config.load_kube_config()  # for out-of-cluster deployment
 
         self.custom_api = client.CustomObjectsApi()
+        self.core_api = client.CoreV1Api()
         self.current_namespace = k8s_namespace or get_current_k8s_namespace()
+
+    def get_worker_namespace_suffix(
+        self, graph_deployment_name: str, dynamo_component: str
+    ) -> Optional[str]:
+        """Return the `nvidia.com/dynamo-worker-hash` label value for the
+        worker pods of a given DGD service.
+
+        The Dynamo operator stamps a per-worker-set hash onto worker pods
+        (label ``nvidia.com/dynamo-worker-hash``) and exports the same
+        value into the worker container as ``DYN_NAMESPACE_WORKER_SUFFIX``.
+        The worker uses that suffix when registering event-plane channels
+        (e.g. forward-pass-metrics), so a planner that wants to subscribe
+        to those channels must rebuild the same suffixed namespace.
+
+        Returns ``None`` when no matching worker pod is found or none
+        carries the hash label. If multiple distinct hashes exist (e.g.
+        during a rolling worker update) the most-recent pod's hash wins
+        and a warning is logged — the typical caller subscribes to one
+        suffix at a time today.
+        """
+        label_selector = (
+            f"nvidia.com/dynamo-graph-deployment-name={graph_deployment_name},"
+            f"nvidia.com/dynamo-component={dynamo_component}"
+        )
+        try:
+            pods = self.core_api.list_namespaced_pod(
+                namespace=self.current_namespace,
+                label_selector=label_selector,
+            )
+        except client.exceptions.ApiException as e:
+            logger.warning(
+                f"Failed to list pods for worker-hash lookup "
+                f"(selector='{label_selector}'): {e}"
+            )
+            return None
+
+        hashes = set()
+        chosen: Optional[str] = None
+        latest_ts = None
+        for pod in pods.items:
+            labels = (pod.metadata.labels or {}) if pod.metadata else {}
+            wh = labels.get("nvidia.com/dynamo-worker-hash")
+            if not wh:
+                continue
+            hashes.add(wh)
+            ts = pod.metadata.creation_timestamp if pod.metadata else None
+            if chosen is None or (ts is not None and ts > latest_ts):
+                chosen = wh
+                latest_ts = ts
+        if len(hashes) > 1:
+            logger.warning(
+                f"Multiple dynamo-worker-hash values found for "
+                f"{graph_deployment_name}/{dynamo_component}: {sorted(hashes)}; "
+                f"using most-recent={chosen}. FPM subscribers attached to one "
+                f"hash will miss events from the others — typical during "
+                f"a rolling worker update."
+            )
+        return chosen
 
     def _get_graph_deployment_from_name(self, graph_deployment_name: str) -> dict:
         """Get the graph deployment from the dynamo graph deployment name"""

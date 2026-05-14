@@ -328,8 +328,38 @@ class NativePlannerBase:
             return
 
         assert self.runtime is not None
+
+        # Workers in Kubernetes mode register event-plane channels under
+        # `<DYN_NAMESPACE>-<DYN_NAMESPACE_WORKER_SUFFIX>` (the suffix is
+        # the per-worker-set hash stamped by the operator on the worker
+        # pod's `nvidia.com/dynamo-worker-hash` label). EventChannelQuery
+        # filters are exact-match, so we have to rebuild the same
+        # suffixed namespace here or the subscribe never matches the
+        # publisher and load-based scaling stays HOLDed forever with
+        # `load_reason=no_fpm_data`.
+        suffixed_namespace = self.namespace
+        if isinstance(self.connector, KubernetesConnector) and worker_info.k8s_name:
+            try:
+                suffix = self.connector.kube_api.get_worker_namespace_suffix(
+                    self.connector.graph_deployment_name,
+                    worker_info.k8s_name,
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort lookup
+                logger.warning(
+                    f"Worker-hash lookup failed for {worker_info.k8s_name}: {e}. "
+                    f"FPM subscriber will use the base namespace and may "
+                    f"miss worker events."
+                )
+                suffix = None
+            if suffix:
+                suffixed_namespace = f"{self.namespace}-{suffix}"
+                logger.info(
+                    f"FPM tracker using worker-suffixed namespace "
+                    f"'{suffixed_namespace}' for {worker_info.k8s_name}"
+                )
+
         endpoint = self.runtime.endpoint(
-            f"{self.namespace}.{worker_info.component_name}.{worker_info.endpoint}"
+            f"{suffixed_namespace}.{worker_info.component_name}.{worker_info.endpoint}"
         )
         sub = FpmEventSubscriber(endpoint)
         sub.start_tracking()

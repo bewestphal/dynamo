@@ -18,7 +18,7 @@ import logging
 import math
 import typing
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 import aiohttp
 from prometheus_api_client import PrometheusConnect
@@ -93,9 +93,21 @@ class FrontendMetricContainer(BaseModel):
 
 class PrometheusAPIClient:
     def __init__(
-        self, url: str, dynamo_namespace: str, metrics_source: str = "frontend"
+        self,
+        url: str,
+        dynamo_namespace: str,
+        metrics_source: str = "frontend",
+        extra_query_params: Optional[Dict[str, str]] = None,
     ):
         self.prom = PrometheusConnect(url=url, disable_ssl=True)
+        if extra_query_params:
+            # prometheus_api_client builds queries via the shared
+            # requests.Session; requests merges Session.params into every
+            # request's URL query string, so setting it once here stamps
+            # the same params onto every PromQL call. Useful for endpoints
+            # that enforce tenancy via a fixed query argument
+            # (e.g. prom-label-proxy's `namespace=` requirement).
+            self.prom._session.params = dict(extra_query_params)
         self.dynamo_namespace = dynamo_namespace
         self.metrics_source = metrics_source  # "frontend" | "router"
 

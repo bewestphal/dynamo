@@ -19,7 +19,7 @@ import math
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, model_validator
@@ -28,6 +28,34 @@ from dynamo.planner.config.aic_interpolation_spec import AICInterpolationSpec
 from dynamo.planner.config.defaults import SLAPlannerDefaults
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_extra_query_params(raw: Optional[str]) -> Optional[Dict[str, str]]:
+    """Parse `key=value` pairs from a comma-separated string.
+
+    Empty / whitespace-only segments are skipped. Returns None when there
+    are no usable pairs so the consumer treats the value as unset.
+    """
+    if not raw:
+        return None
+    parsed: Dict[str, str] = {}
+    for segment in raw.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" not in segment:
+            raise ValueError(
+                f"PROMETHEUS_EXTRA_QUERY_PARAMS segment '{segment}' "
+                f"is missing '=' separator"
+            )
+        key, value = segment.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"PROMETHEUS_EXTRA_QUERY_PARAMS segment '{segment}' has empty key"
+            )
+        parsed[key] = value.strip()
+    return parsed or None
 
 
 class PlannerPreDeploymentSweepMode(str, Enum):
@@ -137,6 +165,20 @@ class PlannerConfig(BaseModel):
             "http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090",
         ),
         exclude=True,
+    )
+    metric_pulling_prometheus_extra_query_params: Optional[Dict[str, str]] = Field(
+        default_factory=lambda: _parse_extra_query_params(
+            os.environ.get("PROMETHEUS_EXTRA_QUERY_PARAMS")
+        ),
+        exclude=True,
+        description=(
+            "Optional fixed key/value pairs appended as URL query parameters "
+            "on every PromQL request. Useful when the upstream Prometheus "
+            "enforces tenancy via a fixed query argument (prom-label-proxy / "
+            "Thanos tenancy ports that require a `namespace=` selector). "
+            "From the env var PROMETHEUS_EXTRA_QUERY_PARAMS, parsed as a "
+            "comma-separated `key=value` list."
+        ),
     )
     metric_reporting_prometheus_port: int = Field(
         default_factory=lambda: int(os.environ.get("PLANNER_PROMETHEUS_PORT", 0))

@@ -47,6 +47,14 @@ class SLAPlannerDefaults(BasePlannerDefaults):
         "PROMETHEUS_ENDPOINT",
         "http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090",
     )
+    # Optional comma-separated key=value pairs appended as URL query
+    # parameters on every PromQL request. Useful when the upstream
+    # Prometheus enforces tenancy via a fixed query argument — e.g.
+    # prom-label-proxy / Thanos tenancy ports that require a `namespace=`
+    # label selector on every query.
+    metric_pulling_prometheus_extra_query_params = os.environ.get(
+        "PROMETHEUS_EXTRA_QUERY_PARAMS"
+    )
     profile_results_dir = "profiling_results"
 
     isl = 3000  # in number of tokens

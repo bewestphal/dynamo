@@ -47,6 +47,30 @@ class SLAPlannerDefaults(BasePlannerDefaults):
         "PROMETHEUS_ENDPOINT",
         "http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090",
     )
+    # Toggle TLS verification on the upstream Prometheus connection.
+    # Default False preserves the previous `disable_ssl=True` behavior.
+    metric_pulling_prometheus_ssl_verify = os.environ.get(
+        "PROMETHEUS_SSL_VERIFY", ""
+    ).lower() in ("1", "true", "yes")
+    # Optional path to a CA bundle used to verify the upstream Prometheus
+    # TLS certificate. Useful when Prometheus is fronted by a service that
+    # uses a private CA (OpenShift service-ca, corp internal roots).
+    # No-op unless SSL verification is also enabled.
+    metric_pulling_prometheus_ca_bundle = os.environ.get("PROMETHEUS_CA_BUNDLE")
+    # Optional bearer token included as `Authorization: Bearer <token>`
+    # on every PromQL request. Read once at startup.
+    metric_pulling_prometheus_token = os.environ.get("PROMETHEUS_TOKEN")
+    # Optional path to a file holding a bearer token; re-read on every
+    # PromQL request so rotating ServiceAccount tokens stay fresh.
+    metric_pulling_prometheus_token_file = os.environ.get("PROMETHEUS_TOKEN_FILE")
+    # Optional comma-separated key=value pairs appended as URL query
+    # parameters on every PromQL request. Useful when the upstream
+    # Prometheus enforces tenancy via a fixed query argument — e.g.
+    # prom-label-proxy / Thanos tenancy ports that require a `namespace=`
+    # label selector on every query.
+    metric_pulling_prometheus_extra_query_params = os.environ.get(
+        "PROMETHEUS_EXTRA_QUERY_PARAMS"
+    )
     profile_results_dir = "profiling_results"
 
     isl = 3000  # in number of tokens

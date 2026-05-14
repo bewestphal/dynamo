@@ -19,7 +19,7 @@ import math
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, model_validator
@@ -28,6 +28,34 @@ from dynamo.planner.config.aic_interpolation_spec import AICInterpolationSpec
 from dynamo.planner.config.defaults import SLAPlannerDefaults
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_extra_query_params(raw: Optional[str]) -> Optional[Dict[str, str]]:
+    """Parse `key=value` pairs from a comma-separated string.
+
+    Empty / whitespace-only segments are skipped. Returns None when there
+    are no usable pairs so the consumer treats the value as unset.
+    """
+    if not raw:
+        return None
+    parsed: Dict[str, str] = {}
+    for segment in raw.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" not in segment:
+            raise ValueError(
+                f"PROMETHEUS_EXTRA_QUERY_PARAMS segment '{segment}' "
+                f"is missing '=' separator"
+            )
+        key, value = segment.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"PROMETHEUS_EXTRA_QUERY_PARAMS segment '{segment}' has empty key"
+            )
+        parsed[key] = value.strip()
+    return parsed or None
 
 
 class PlannerPreDeploymentSweepMode(str, Enum):
@@ -137,6 +165,58 @@ class PlannerConfig(BaseModel):
             "http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090",
         ),
         exclude=True,
+    )
+    metric_pulling_prometheus_ssl_verify: bool = Field(
+        default_factory=lambda: os.environ.get("PROMETHEUS_SSL_VERIFY", "").lower()
+        in ("1", "true", "yes"),
+        exclude=True,
+        description=(
+            "When True, the planner verifies the upstream Prometheus TLS "
+            "chain. Default False preserves the prior `disable_ssl=True` "
+            "behavior; flip when the upstream cert can be validated."
+        ),
+    )
+    metric_pulling_prometheus_ca_bundle: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("PROMETHEUS_CA_BUNDLE"),
+        exclude=True,
+        description=(
+            "Optional path to a CA bundle used to verify the upstream "
+            "Prometheus TLS certificate. Useful when Prometheus is fronted "
+            "by a service that uses a private CA (OpenShift service-ca, "
+            "corp internal roots). No-op unless SSL verification is enabled."
+        ),
+    )
+    metric_pulling_prometheus_token: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("PROMETHEUS_TOKEN"),
+        exclude=True,
+        description=(
+            "Optional bearer token attached as `Authorization: Bearer "
+            "<token>` on every PromQL request. Read once at startup; for "
+            "rotating credentials use metric_pulling_prometheus_token_file."
+        ),
+    )
+    metric_pulling_prometheus_token_file: Optional[str] = Field(
+        default_factory=lambda: os.environ.get("PROMETHEUS_TOKEN_FILE"),
+        exclude=True,
+        description=(
+            "Optional path to a file holding a bearer token. Re-read on "
+            "every PromQL request so rotating ServiceAccount tokens stay "
+            "fresh without restarting the planner."
+        ),
+    )
+    metric_pulling_prometheus_extra_query_params: Optional[Dict[str, str]] = Field(
+        default_factory=lambda: _parse_extra_query_params(
+            os.environ.get("PROMETHEUS_EXTRA_QUERY_PARAMS")
+        ),
+        exclude=True,
+        description=(
+            "Optional fixed key/value pairs appended as URL query parameters "
+            "on every PromQL request. Useful when the upstream Prometheus "
+            "enforces tenancy via a fixed query argument (prom-label-proxy / "
+            "Thanos tenancy ports that require a `namespace=` selector). "
+            "From the env var PROMETHEUS_EXTRA_QUERY_PARAMS, parsed as a "
+            "comma-separated `key=value` list."
+        ),
     )
     metric_reporting_prometheus_port: int = Field(
         default_factory=lambda: int(os.environ.get("PLANNER_PROMETHEUS_PORT", 0))

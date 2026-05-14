@@ -18,15 +18,36 @@ import logging
 import math
 import typing
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 import aiohttp
+import requests.auth
 from prometheus_api_client import PrometheusConnect
 from prometheus_client.parser import text_string_to_metric_families
 from pydantic import BaseModel, ValidationError
 
 from dynamo import prometheus_names
 from dynamo.runtime.logging import configure_dynamo_logging
+
+
+class _BearerTokenFileAuth(requests.auth.AuthBase):
+    """requests auth adapter that re-reads a bearer token from disk per request.
+
+    Useful for rotating tokens such as Kubernetes projected ServiceAccount
+    tokens — the kubelet replaces the on-disk file periodically and we
+    want to pick up the new contents without restarting the planner.
+    Newlines are stripped from the file contents.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+
+    def __call__(self, request: "requests.PreparedRequest") -> "requests.PreparedRequest":  # type: ignore[name-defined]
+        with open(self._path) as f:
+            token = f.read().strip()
+        request.headers["Authorization"] = f"Bearer {token}"
+        return request
+
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -93,9 +114,42 @@ class FrontendMetricContainer(BaseModel):
 
 class PrometheusAPIClient:
     def __init__(
-        self, url: str, dynamo_namespace: str, metrics_source: str = "frontend"
+        self,
+        url: str,
+        dynamo_namespace: str,
+        metrics_source: str = "frontend",
+        ssl_verify: bool = False,
+        ca_bundle: Optional[str] = None,
+        bearer_token: Optional[str] = None,
+        bearer_token_file: Optional[str] = None,
+        extra_query_params: Optional[Dict[str, str]] = None,
     ):
-        self.prom = PrometheusConnect(url=url, disable_ssl=True)
+        # disable_ssl=True (default) preserves prior behavior; flip via the
+        # ssl_verify config knob (env: PROMETHEUS_SSL_VERIFY) when the
+        # upstream cert can be validated.
+        headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else None
+        self.prom = PrometheusConnect(
+            url=url, disable_ssl=not ssl_verify, headers=headers
+        )
+        if ca_bundle:
+            # prometheus_api_client.PrometheusConnect has no constructor arg
+            # for a custom CA bundle; override the session's verify path
+            # post-init. Setting verify=<path> here turns on TLS verification
+            # using that bundle. Caller controls when to set this.
+            self.prom._session.verify = ca_bundle
+        if bearer_token_file:
+            # Attach a requests-auth callable so the token is re-read from
+            # disk on every PromQL request — supports rotating SA tokens
+            # without restarting the planner.
+            self.prom._session.auth = _BearerTokenFileAuth(bearer_token_file)
+        if extra_query_params:
+            # prometheus_api_client builds queries via the shared
+            # requests.Session; requests merges Session.params into every
+            # request's URL query string, so setting it once here stamps
+            # the same params onto every PromQL call. Useful for endpoints
+            # that enforce tenancy via a fixed query argument
+            # (e.g. prom-label-proxy's `namespace=` requirement).
+            self.prom._session.params = dict(extra_query_params)
         self.dynamo_namespace = dynamo_namespace
         self.metrics_source = metrics_source  # "frontend" | "router"
 

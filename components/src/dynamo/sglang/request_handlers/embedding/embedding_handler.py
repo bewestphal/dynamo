@@ -62,7 +62,7 @@ class EmbeddingWorkerHandler(BaseWorkerHandler):
         result = await self.engine.async_encode(
             prompt=prompt,
             external_trace_header=trace_header,
-            rid=trace_id,
+            rid=[trace_id],
         )
 
         # Transform the response to OpenAI format

@@ -93,6 +93,9 @@ ARG PLANNER_RUNTIME_IMAGE_TAG={{ context.dynamo.planner_runtime_image_tag }}
 
 {% if framework == "vllm" -%}
 ARG MAX_JOBS={{ context.vllm.max_jobs }}
+{% if device == "cpu" -%}
+ARG VLLM_REF={{ context.vllm.cpu.vllm_ref }}
+{% endif -%}
 {% if device == "cuda" -%}
 # FlashInfer cubin/jit-cache version used by the vLLM installer.
 ARG FLASHINF_REF={{ context.vllm.flashinf_ref }}

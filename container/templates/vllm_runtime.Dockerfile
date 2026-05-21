@@ -20,6 +20,10 @@ ARG ENABLE_KVBM
 ARG ENABLE_GPU_MEMORY_SERVICE
 ARG VLLM_OMNI_REF
 ARG NIXL_REF
+{% if device == "cpu" %}
+ARG MAX_JOBS
+ARG VLLM_REF
+{% endif %}
 
 WORKDIR /workspace
 
@@ -62,6 +66,68 @@ RUN userdel -r ubuntu > /dev/null 2>&1 || true \
     && mkdir -p /etc/profile.d \
     && echo 'umask 002' > /etc/profile.d/00-umask.sh
 
+{% if device == "cpu" %}
+# The CPU runtime starts from plain Ubuntu rather than a pre-built vllm-openai-cpu image,
+# so Python and vLLM must be installed from source.
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+        build-essential \
+        ninja-build \
+        gcc-12 \
+        g++-12 \
+        ccache \
+        git \
+        git-lfs \
+        curl \
+        ca-certificates \
+        zip \
+        unzip \
+        lsb-release \
+        numactl \
+        wget \
+        libnuma-dev \
+        libtcmalloc-minimal4 \
+        libsm6 \
+        libxext6 \
+        libgl1 \
+        libxcb1 \
+        jq \
+        lsof && \
+    rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-12 && \
+    ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3 && \
+    ln -sf /usr/bin/python3 /usr/local/bin/python
+
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export UV_CACHE_DIR=/root/.cache/uv UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv venv ${VIRTUAL_ENV} --python /usr/bin/python${PYTHON_VERSION} && \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python --upgrade pip setuptools wheel && \
+    git clone --depth 1 --branch ${VLLM_REF} https://github.com/vllm-project/vllm.git /tmp/vllm && \
+    cd /tmp/vllm && \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        --index-strategy unsafe-best-match \
+        -r requirements/cpu.txt && \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        --index-strategy unsafe-best-match \
+        -r requirements/build/cpu.txt && \
+    VLLM_TARGET_DEVICE=cpu MAX_JOBS=${MAX_JOBS:-10} \
+        ${VIRTUAL_ENV}/bin/python setup.py bdist_wheel \
+        --dist-dir=dist --py-limited-api=cp38 && \
+    uv pip install --python ${VIRTUAL_ENV}/bin/python dist/*.whl && \
+    cd / && ${VIRTUAL_ENV}/bin/python -c \
+        'import vllm; print(f"vLLM CPU frontend ok: {vllm.__version__}")' && \
+    rm -rf /tmp/vllm
+
+{% endif %}
 {% if device != "cuda" %}
 # Copy UCX and NIXL from wheel_builder for CPU/XPU devices
 # (CUDA devices use NIXL from upstream vLLM wheels)
@@ -107,8 +173,8 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     NIXL_VERSION="${NIXL_REF#v}"; \
     uv pip install \
         {{ pip_target }} --force-reinstall --no-deps \
-        "nixl==${NIXL_VERSION}" \
-        "nixl-cu12==${NIXL_VERSION}"
+        "nixl==${NIXL_VERSION}"{% if device != "cpu" %} \
+        "nixl-cu12==${NIXL_VERSION}"{% endif %}
 {% endif %}
 
 # Copy attribution files and wheels
@@ -143,6 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
         if [ -n "$GMS_WHEEL" ]; then uv pip install {{ pip_target }} --no-deps "$GMS_WHEEL"; fi; \
     fi
 
+{% if device != "cpu" %}
 # vLLM-Omni's audio helpers shell out to SoX, and the launch script examples use
 # jq for readable curl output just like the upstream omni image does.
 RUN set -eux; \
@@ -162,6 +229,7 @@ RUN --mount=type=bind,source=./container/deps/vllm/protected_packages.txt,target
     export UV_CACHE_DIR=/root/.cache/uv; \
     export VLLM_OMNI_TARGET_DEVICE={{ device }}; \
     bash /tmp/install_vllm_omni.sh
+{% endif %}
 
 {% if device == "xpu" %}
 # Remove conflicting standard triton package for XPU and reinstall triton-xpu
@@ -182,10 +250,12 @@ RUN --mount=type=bind,from=wheel_builder,source=/usr/local/,target=/tmp/usr/loca
     cp -r /tmp/usr/local/src/ffmpeg /usr/local/src/
 {% endif %}
 
+{% if device != "cpu" %}
 # Remove the vLLM source tree shipped in the base image to avoid pytest
 # collection conflicts (duplicate conftest plugin registration) and stale
 # tool scripts referencing files not present in Dynamo's build context.
 RUN rm -rf /workspace/vllm
+{% endif %}
 
 USER dynamo
 

@@ -3490,6 +3490,8 @@ impl OpenAIPreprocessor {
                     | "kimi_k25"
                     | "mistral"
                     | "minimax_m2"
+                    | "minimax_m3"
+                    | "minimax-m3"
                     | "minimax_append_think"
                     | "nemotron_nano"
                     | "nemotron3"
@@ -4899,6 +4901,22 @@ mod tests {
             )),
             "minimax_append_think must retain the guided-JSON bypass"
         );
+    }
+
+    /// MiniMax M3 forced-tool requests use bare JSON from token zero. Its
+    /// reasoning parser must not consume that JSON before the tool-call jail.
+    #[test]
+    fn test_minimax_m3_guided_json_bypasses_reasoning_parser() {
+        for parser in ["minimax_m3", "minimax-m3"] {
+            assert!(
+                OpenAIPreprocessor::is_force_reasoning_parser(Some(parser)),
+                "{parser} must bypass reasoning parsing for forced guided output"
+            );
+            assert!(
+                !OpenAIPreprocessor::supports_reasoning_before_guided_json(Some(parser)),
+                "{parser} forced tools are constrained from token zero"
+            );
+        }
     }
 
     /// Verifies parser-specific openers that can be confused with guided JSON.

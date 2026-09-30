@@ -117,6 +117,9 @@ def _deprecated_overlap_score_weight_from_env() -> Optional[tuple[str, float]]:
 
 
 def _default_overlap_score_weight() -> Optional[float]:
+    if "DYN_ROUTER_PREFILL_LOAD_SCALE" in os.environ:
+        return None
+
     legacy = _deprecated_overlap_score_weight_from_env()
     if legacy is None:
         return None

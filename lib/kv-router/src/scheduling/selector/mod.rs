@@ -327,6 +327,7 @@ fn log_selection<C: WorkerConfigLike>(
             worker_type = %worker_type,
             dp_rank = ?worker.dp_rank,
             logit = cost,
+            effective_cached_blocks = effective_overlap_blocks,
             host_pinned_blocks,
             disk_blocks,
             "Selected worker"
@@ -380,6 +381,24 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
 
     let weights = selection_weights(kv_router_config, request);
     let input = MaterializedSelectionInput::new(request, block_size, weights);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (&candidate, &effective_cached_blocks) in &request.overlap.effective_overlap_blocks {
+            if effective_cached_blocks == 0.0 {
+                continue;
+            }
+            if let Err(reason) = eligibility.validate_worker_rank(workers, candidate) {
+                tracing::debug!(
+                    request_id = request.mode.request_id().unwrap_or("-"),
+                    worker_type,
+                    worker_id = candidate.worker_id,
+                    dp_rank = candidate.dp_rank,
+                    effective_cached_blocks,
+                    %reason,
+                    "Cached worker excluded from selection"
+                );
+            }
+        }
+    }
     let selected = match state {
         WorkerSelectionPolicyStateRef::Default(picker) => {
             let scorer = DefaultWorkerScorer {

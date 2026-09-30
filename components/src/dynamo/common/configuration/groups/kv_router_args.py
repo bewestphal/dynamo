@@ -33,6 +33,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "overlap_score_credit",
     "overlap_score_credit_decay",
     "prefill_load_scale",
+    "active_prefill_load_scale",
     "decode_active_request_weight",
     "host_cache_hit_weight",
     "disk_cache_hit_weight",
@@ -197,6 +198,7 @@ class KvRouterConfigBase(ConfigBase):
     overlap_score_credit: float
     overlap_score_credit_decay: float
     prefill_load_scale: float
+    active_prefill_load_scale: float
     decode_active_request_weight: float
     host_cache_hit_weight: float
     disk_cache_hit_weight: float
@@ -350,6 +352,18 @@ class KvRouterArgGroup(ArgGroup):
             ),
             arg_type=float,
             dest="prefill_load_scale",
+        )
+        add_argument(
+            g,
+            flag_name="--router-active-prefill-load-scale",
+            env_var="DYN_ROUTER_ACTIVE_PREFILL_LOAD_SCALE",
+            default=1.0,
+            help=(
+                "[EXPERIMENTAL] KV Router: Scale for already-active prefill tokens "
+                "within the prompt-side load score. Must be between 0 and 1."
+            ),
+            arg_type=float,
+            dest="active_prefill_load_scale",
         )
         add_argument(
             g,

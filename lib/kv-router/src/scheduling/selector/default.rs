@@ -342,7 +342,15 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             return logit;
         }
 
-        let adjusted_prefill_blocks = (load.raw_prefill_blocks - overlap_credit_blocks).max(0.0);
+        let discounted_active_prefill_blocks = if context.track_prefill_tokens {
+            (1.0 - kv_router_config.active_prefill_load_scale) * load.active_prefill_tokens as f64
+                / context.block_size as f64
+        } else {
+            0.0
+        };
+        let adjusted_prefill_blocks =
+            (load.raw_prefill_blocks - overlap_credit_blocks - discounted_active_prefill_blocks)
+                .max(0.0);
         let prefill_cost_blocks = weights.prefill_load_scale * adjusted_prefill_blocks;
         let logit = prefill_cost_blocks + decode_cost_blocks + active_request_cost_blocks;
 
@@ -360,7 +368,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                  {} shared blocks beyond device (multiplier={shared_cache_multiplier:.2}): {logit:.3} \
                  = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + active_request_cost_blocks \
                  = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} + {active_request_cost_blocks:.3} \
-                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, \
+                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, \
                  overlap_credit_decay: {overlap_credit_decay:.3})",
                 worker.worker_id,
                 worker.dp_rank,
@@ -376,7 +384,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks: {logit:.3} \
                  = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + active_request_cost_blocks \
                  = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} + {active_request_cost_blocks:.3} \
-                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, \
+                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, \
                  overlap_credit_decay: {overlap_credit_decay:.3})",
                 worker.worker_id,
                 worker.dp_rank,
@@ -1728,6 +1736,55 @@ mod tests {
 
         request.track_prefill_tokens = false;
         assert_eq!(worker_logit(&selector, &request, worker, 16, weights), 5.0);
+    }
+
+    #[test]
+    fn test_active_prefill_scale_preserves_cache_tradeoff() {
+        let hot = WorkerWithDpRank::from_worker_id(0);
+        let cold = WorkerWithDpRank::from_worker_id(1);
+        let mut request = base_request(32);
+        request.overlap.effective_cached_tokens.insert(hot, 16);
+        request.overlap.tier_overlap_blocks.device.insert(hot, 1);
+        request.worker_loads.insert(
+            hot,
+            crate::sequences::WorkerLoadProjection {
+                active_prefill_tokens: 128,
+                ..Default::default()
+            },
+        );
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            prefill_load_scale: 1.0,
+            shared_cache_multiplier: 0.0,
+        };
+        let default = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
+        assert!(
+            worker_logit(&default, &request, hot, 16, weights)
+                > worker_logit(&default, &request, cold, 16, weights)
+        );
+
+        let discounted = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                active_prefill_load_scale: 0.1,
+                ..Default::default()
+            }),
+            "test",
+        );
+        assert!(
+            worker_logit(&discounted, &request, hot, 16, weights)
+                < worker_logit(&discounted, &request, cold, 16, weights)
+        );
+
+        request
+            .worker_loads
+            .get_mut(&hot)
+            .unwrap()
+            .active_prefill_tokens = 640;
+        assert!(
+            worker_logit(&discounted, &request, hot, 16, weights)
+                > worker_logit(&discounted, &request, cold, 16, weights)
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "overlap_score_credit_decay",
     "prefill_load_scale",
     "active_prefill_load_scale",
+    "active_kv_block_load_scale",
     "decode_active_request_weight",
     "host_cache_hit_weight",
     "disk_cache_hit_weight",
@@ -199,6 +200,7 @@ class KvRouterConfigBase(ConfigBase):
     overlap_score_credit_decay: float
     prefill_load_scale: float
     active_prefill_load_scale: float
+    active_kv_block_load_scale: float
     decode_active_request_weight: float
     host_cache_hit_weight: float
     disk_cache_hit_weight: float
@@ -364,6 +366,18 @@ class KvRouterArgGroup(ArgGroup):
             ),
             arg_type=float,
             dest="active_prefill_load_scale",
+        )
+        add_argument(
+            g,
+            flag_name="--router-active-kv-block-load-scale",
+            env_var="DYN_ROUTER_ACTIVE_KV_BLOCK_LOAD_SCALE",
+            default=1.0,
+            help=(
+                "[EXPERIMENTAL] KV Router: Scale for existing active KV blocks "
+                "within the worker load score. Must be between 0 and 1."
+            ),
+            arg_type=float,
+            dest="active_kv_block_load_scale",
         )
         add_argument(
             g,

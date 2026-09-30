@@ -254,6 +254,7 @@ impl<'a> MaterializedSelectionInput<'a> {
                 raw_prefill_blocks: raw_prefill_tokens / self.context.block_size as f64,
                 active_prefill_tokens: worker_load.active_prefill_tokens,
                 decode_cost_blocks: worker_load.potential_decode_blocks() as f64,
+                active_kv_blocks: worker_load.active_decode_blocks as f64,
                 active_requests: worker_load.active_requests,
             }
         } else {

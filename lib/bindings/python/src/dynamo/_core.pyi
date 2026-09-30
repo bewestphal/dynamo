@@ -1807,6 +1807,7 @@ class KvRouterConfig:
         overlap_score_credit_decay: float = 0.0,
         prefill_load_scale: float = 1.0,
         active_prefill_load_scale: float = 1.0,
+        active_kv_block_load_scale: float = 1.0,
         decode_active_request_weight: float = 0.0,
         router_policy_config: Optional[str] = None,
         router_prefill_policy: Optional[str] = None,
@@ -1823,6 +1824,7 @@ class KvRouterConfig:
             overlap_score_credit: Finite, non-negative credit multiplier for device-local prefix overlap (default: 1.0). Values above 1.0 give device overlap extra credit, with adjusted prefill cost clamped at zero.
             prefill_load_scale: Scale for adjusted prompt-side prefill load after cache-hit credits (default: 1.0)
             active_prefill_load_scale: Scale for already-active prefill tokens within the prompt-side score (default: 1.0)
+            active_kv_block_load_scale: Scale for existing active KV blocks within worker load (default: 1.0)
             decode_active_request_weight: Experimental block-equivalent decode cost added for each active request on a candidate worker (default: 0.0)
             host_cache_hit_weight: Credit multiplier for host-pinned cache hits (default: 0.75)
             disk_cache_hit_weight: Credit multiplier for disk/external cache hits (default: 0.25)
@@ -1915,6 +1917,10 @@ class KvRouterConfig:
     @active_prefill_load_scale.setter
     def active_prefill_load_scale(self, value: float) -> None: ...
     @property
+    def active_kv_block_load_scale(self) -> float: ...
+    @active_kv_block_load_scale.setter
+    def active_kv_block_load_scale(self, value: float) -> None: ...
+    @property
     def decode_active_request_weight(self) -> float: ...
     @decode_active_request_weight.setter
     def decode_active_request_weight(self, value: float) -> None: ...
@@ -1927,6 +1933,7 @@ class KvRouterConfig:
         overlap_score_credit_decay: Optional[float] = None,
         prefill_load_scale: Optional[float] = None,
         active_prefill_load_scale: Optional[float] = None,
+        active_kv_block_load_scale: Optional[float] = None,
         decode_active_request_weight: Optional[float] = None,
     ) -> "KvRouterConfig": ...
 

@@ -96,6 +96,7 @@ pub struct WorkerLoadInput {
     pub(super) raw_prefill_blocks: f64,
     pub(super) active_prefill_tokens: usize,
     pub(super) decode_cost_blocks: f64,
+    pub(super) active_kv_blocks: f64,
     pub(super) active_requests: usize,
 }
 

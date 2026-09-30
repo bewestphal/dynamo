@@ -309,7 +309,9 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             + kv_router_config.host_cache_hit_weight * cache.host_overlap_blocks
             + kv_router_config.disk_cache_hit_weight * cache.disk_overlap_blocks
             + shared_overlap_blocks;
-        let decode_cost_blocks = load.decode_cost_blocks;
+        let discounted_active_kv_blocks =
+            (1.0 - kv_router_config.active_kv_block_load_scale) * load.active_kv_blocks;
+        let decode_cost_blocks = load.decode_cost_blocks - discounted_active_kv_blocks;
         let active_request_cost_blocks =
             kv_router_config.decode_active_request_weight * load.active_requests as f64;
 
@@ -368,7 +370,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                  {} shared blocks beyond device (multiplier={shared_cache_multiplier:.2}): {logit:.3} \
                  = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + active_request_cost_blocks \
                  = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} + {active_request_cost_blocks:.3} \
-                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, \
+                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, discounted_active_kv_blocks: {discounted_active_kv_blocks:.3}, \
                  overlap_credit_decay: {overlap_credit_decay:.3})",
                 worker.worker_id,
                 worker.dp_rank,
@@ -384,7 +386,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 "{formula_name} for worker_id={} dp_rank={:?} with {effective_overlap_blocks:.2} effective cached blocks: {logit:.3} \
                  = prefill_load_scale * adjusted_prefill_blocks + decode_blocks + active_request_cost_blocks \
                  = {prefill_load_scale:.3} * {adjusted_prefill_blocks:.3} + {decode_cost_blocks:.3} + {active_request_cost_blocks:.3} \
-                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, \
+                 (raw_prefill_blocks: {:.3}, overlap_credit_blocks: {overlap_credit_blocks:.3}, discounted_active_prefill_blocks: {discounted_active_prefill_blocks:.3}, discounted_active_kv_blocks: {discounted_active_kv_blocks:.3}, \
                  overlap_credit_decay: {overlap_credit_decay:.3})",
                 worker.worker_id,
                 worker.dp_rank,
@@ -1749,6 +1751,7 @@ mod tests {
             hot,
             crate::sequences::WorkerLoadProjection {
                 active_prefill_tokens: 128,
+                active_decode_blocks: 8,
                 ..Default::default()
             },
         );
@@ -1766,7 +1769,8 @@ mod tests {
 
         let discounted = DefaultWorkerSelector::new(
             Some(KvRouterConfig {
-                active_prefill_load_scale: 0.1,
+                active_prefill_load_scale: 0.03,
+                active_kv_block_load_scale: 0.03,
                 ..Default::default()
             }),
             "test",
@@ -1781,6 +1785,11 @@ mod tests {
             .get_mut(&hot)
             .unwrap()
             .active_prefill_tokens = 640;
+        request
+            .worker_loads
+            .get_mut(&hot)
+            .unwrap()
+            .active_decode_blocks = 40;
         assert!(
             worker_logit(&discounted, &request, hot, 16, weights)
                 > worker_logit(&discounted, &request, cold, 16, weights)

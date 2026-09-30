@@ -232,7 +232,8 @@ fn kv_router_config_from_lookup(
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY") {
         config.overlap_score_credit_decay = value;
     }
-    if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_PREFILL_LOAD_SCALE") {
+    let explicit_prefill_load_scale = parse_f64(&get_env, "DYN_ROUTER_PREFILL_LOAD_SCALE");
+    if let Some(value) = explicit_prefill_load_scale {
         config.prefill_load_scale = value;
     }
     if let Some(value) = parse_f64(&get_env, "DYN_ROUTER_DECODE_ACTIVE_REQUEST_WEIGHT") {
@@ -243,12 +244,18 @@ fn kv_router_config_from_lookup(
         "DYN_OVERLAP_SCORE_WEIGHT",
     ] {
         if let Some(value) = parse_f64(&get_env, key) {
-            tracing::warn!("{key} is deprecated; use DYN_ROUTER_PREFILL_LOAD_SCALE");
-            apply_deprecated_overlap_score_weight_override(
-                value,
-                &mut config.overlap_score_credit,
-                &mut config.prefill_load_scale,
-            );
+            if explicit_prefill_load_scale.is_some() {
+                tracing::warn!(
+                    "{key} is deprecated and ignored because DYN_ROUTER_PREFILL_LOAD_SCALE is set"
+                );
+            } else {
+                tracing::warn!("{key} is deprecated; use DYN_ROUTER_PREFILL_LOAD_SCALE");
+                apply_deprecated_overlap_score_weight_override(
+                    value,
+                    &mut config.overlap_score_credit,
+                    &mut config.prefill_load_scale,
+                );
+            }
             break;
         }
     }
@@ -1676,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamo_env_config_preserves_deprecated_alias_precedence() {
+    fn dynamo_env_config_prefers_explicit_prefill_load_scale() {
         let config = config_from_values(&[
             ("DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT", "0.25"),
             ("DYN_ROUTER_PREFILL_LOAD_SCALE", "2"),
@@ -1685,7 +1692,27 @@ mod tests {
         ]);
 
         assert_eq!(config.overlap_score_credit, 0.25);
-        assert_eq!(config.prefill_load_scale, 3.0);
+        assert_eq!(config.prefill_load_scale, 2.0);
+
+        let image_default = config_from_values(&[
+            ("DYN_ROUTER_PREFILL_LOAD_SCALE", "3"),
+            ("DYN_ROUTER_KV_OVERLAP_SCORE_WEIGHT", "0.1"),
+        ]);
+        assert_eq!(image_default.overlap_score_credit, 1.0);
+        assert_eq!(image_default.prefill_load_scale, 3.0);
+
+        let legacy_disabled = config_from_values(&[
+            ("DYN_ROUTER_PREFILL_LOAD_SCALE", "3"),
+            ("DYN_ROUTER_KV_OVERLAP_SCORE_WEIGHT", "0"),
+        ]);
+        assert_eq!(legacy_disabled.overlap_score_credit, 1.0);
+        assert_eq!(legacy_disabled.prefill_load_scale, 3.0);
+
+        let legacy = config_from_values(&[
+            ("DYN_ROUTER_KV_OVERLAP_SCORE_WEIGHT", "3"),
+            ("DYN_OVERLAP_SCORE_WEIGHT", "4"),
+        ]);
+        assert_eq!(legacy.prefill_load_scale, 3.0);
 
         let disabled = config_from_values(&[
             ("DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT", "0.75"),

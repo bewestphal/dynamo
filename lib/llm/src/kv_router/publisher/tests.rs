@@ -15,6 +15,230 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(test)]
+mod namespace_nats_tests {
+    use super::*;
+    use dynamo_kv_router::protocols::WorkerWithDpRank;
+    use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};
+    use dynamo_kv_router::services::indexer::backend::{Indexer, create_indexer};
+    use dynamo_runtime::distributed::DistributedConfig;
+    use dynamo_runtime::transports::event_plane::{EventSubscriber, EventTransportKind};
+    use dynamo_runtime::transports::nats;
+    use dynamo_runtime::{DistributedRuntime, Runtime};
+    use serde_json::json;
+
+    async fn receive_and_apply(
+        subscriber: &mut dynamo_runtime::transports::event_plane::TypedEventSubscriber<
+            Vec<RouterEvent>,
+        >,
+        indexer: &Indexer,
+        expected_events: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut count = 0;
+            while count < expected_events {
+                let (_envelope, events) = subscriber
+                    .next()
+                    .await
+                    .expect("NATS event stream closed")
+                    .expect("decode NATS event batch");
+                count += events.len();
+                for event in events {
+                    assert_eq!(event.worker_id, 7);
+                    indexer
+                        .apply_event_routed(event)
+                        .await
+                        .expect("apply received event");
+                }
+            }
+            assert_eq!(count, expected_events);
+            // FIFO barrier: queries must observe every admitted event.
+            indexer
+                .dump_events()
+                .await
+                .expect("flush receiving indexer");
+        })
+        .await
+        .expect("timed out receiving NATS events");
+    }
+
+    /// Manual event-pipeline integration test; requires a local NATS server.
+    /// No inference engine, model weights, or physical KV cache is used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires DYNAMO_TEST_NATS_URL pointing to a local NATS server"]
+    async fn nats_namespace_lifetime_preserves_cpu_prefix_after_gpu_remove() {
+        let url = std::env::var("DYNAMO_TEST_NATS_URL").expect("set DYNAMO_TEST_NATS_URL");
+        let mut config = DistributedConfig::process_local();
+        config.nats_config = Some(nats::ClientOptions::builder().server(url).build().unwrap());
+        config.event_transport_kind = EventTransportKind::Nats;
+        let drt = DistributedRuntime::new(Runtime::from_current().unwrap(), config)
+            .await
+            .unwrap();
+        let worker = WorkerWithDpRank::new(7, 0);
+        for salt in [None, Some("tenant-a")] {
+            let component = drt
+                .namespace(format!("namespace-nats-{}", uuid::Uuid::new_v4()))
+                .unwrap()
+                .component("worker")
+                .unwrap();
+            let endpoint = component.endpoint("generate");
+            let mut subscriber = EventSubscriber::for_endpoint_with_transport(
+                &endpoint,
+                KV_EVENT_SUBJECT,
+                EventTransportKind::Nats,
+            )
+            .await
+            .unwrap()
+            .typed::<Vec<RouterEvent>>();
+            let directory = tempfile::tempdir().unwrap();
+            let zmq_endpoint = format!("ipc://{}", directory.path().join("events.sock").display());
+            let socket = crate::utils::zmq::bind_pub_socket(&zmq_endpoint)
+                .await
+                .unwrap();
+            let publisher = KvEventPublisher::new_with_local_indexer_and_worker_id_at(
+                endpoint.clone(),
+                endpoint.id(),
+                Some(7),
+                4,
+                Some(KvEventSourceConfig::Zmq {
+                    endpoint: zmq_endpoint,
+                    topic: String::new(),
+                    image_token_id: None,
+                    video_token_id: None,
+                }),
+                false,
+                0,
+                Some(1),
+            )
+            .unwrap();
+            let indexer = create_indexer(4, 1);
+            let mut sequence = 0u64;
+            let root = |medium: &str| {
+                json!({
+                    "type": "BlockStored", "block_hashes": [101], "parent_block_hash": null,
+                    "token_ids": [10,11,12,13], "block_size": 4,
+                    "medium": medium,
+                    "extra_keys": salt.map(|salt| vec![vec![format!("dynamo-cache-salt:{salt}")]]),
+                })
+            };
+            // Probe until both the engine SUB and NATS subscription are ready.
+            // Use a distinct block; reset it before the measured sequence.
+            let probe = json!({"type":"BlockStored", "block_hashes":[99],
+                "parent_block_hash":null, "token_ids":[90,91,92,93],
+                "block_size":4, "medium":"GPU"});
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let payload =
+                        rmp_serde::to_vec_named(&(0.0, vec![probe.clone()], Some(0_i32))).unwrap();
+                    crate::utils::zmq::send_multipart(
+                        &socket,
+                        vec![Vec::new(), sequence.to_be_bytes().to_vec(), payload],
+                    )
+                    .await
+                    .unwrap();
+                    sequence += 1;
+                    if let Ok(Some(Ok((_envelope, _events)))) =
+                        tokio::time::timeout(Duration::from_millis(100), subscriber.next()).await
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("publisher pipeline did not become ready");
+            let mut batches = vec![
+                vec![json!({"type":"AllBlocksCleared"})],
+                vec![root("GPU"), root("CPU_PINNED")],
+                vec![
+                    json!({"type":"BlockRemoved", "block_hashes":[101], "medium":"GPU"}),
+                    json!({"type":"BlockStored", "block_hashes":[102], "parent_block_hash":101,
+                        "token_ids":[20,21,22,23], "block_size":4, "medium":"CPU_PINNED"}),
+                ],
+            ];
+            for (phase, events) in batches.drain(..).enumerate() {
+                let count = events.len();
+                let payload = rmp_serde::to_vec_named(&(0.0, events, Some(0_i32))).unwrap();
+                crate::utils::zmq::send_multipart(
+                    &socket,
+                    vec![Vec::new(), sequence.to_be_bytes().to_vec(), payload],
+                )
+                .await
+                .unwrap();
+                sequence += 1;
+                receive_and_apply(&mut subscriber, &indexer, count).await;
+                if phase == 1 {
+                    let hashes = compute_block_hash_for_seq(
+                        &[10, 11, 12, 13, 20, 21, 22, 23],
+                        4,
+                        BlockHashOptions {
+                            cache_namespace: salt,
+                            ..Default::default()
+                        },
+                    );
+                    let hits = indexer.find_tiered_matches(hashes).await.unwrap();
+                    assert_eq!(hits.device.overlap_scores.scores[&worker], 1);
+                    // Lower-tier queries report extensions beyond the GPU prefix.
+                    // Verify the overlapping CPU root through its stored event.
+                    assert!(
+                        indexer
+                            .dump_events()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .any(|event| event.storage_tier == StorageTier::HostPinned)
+                    );
+                }
+            }
+            let query = |salt| {
+                compute_block_hash_for_seq(
+                    &[10, 11, 12, 13, 20, 21, 22, 23],
+                    4,
+                    BlockHashOptions {
+                        cache_namespace: salt,
+                        ..Default::default()
+                    },
+                )
+            };
+            let hits = indexer.find_tiered_matches(query(salt)).await.unwrap();
+            let cpu_blocks = hits.lower_tier[&StorageTier::HostPinned]
+                .hits
+                .get(&worker)
+                .copied()
+                .unwrap_or(0);
+            let gpu_blocks = hits
+                .device
+                .overlap_scores
+                .scores
+                .get(&worker)
+                .copied()
+                .unwrap_or(0);
+            let other = indexer
+                .find_tiered_matches(query(Some("tenant-b")))
+                .await
+                .unwrap();
+            let wrong_namespace_blocks = other.lower_tier[&StorageTier::HostPinned]
+                .hits
+                .get(&worker)
+                .copied()
+                .unwrap_or(0);
+            println!(
+                "NATS_NAMESPACE_PROOF salt={salt:?} gpu_tokens={} cpu_tokens={} wrong_namespace_tokens={}",
+                gpu_blocks * 4,
+                cpu_blocks * 4,
+                wrong_namespace_blocks * 4
+            );
+            drop(publisher);
+            assert_eq!(gpu_blocks, 0);
+            assert_eq!(wrong_namespace_blocks, 0);
+            assert_eq!(
+                cpu_blocks, 2,
+                "retained CPU prefix must match after GPU removal"
+            );
+        }
+        drt.shutdown();
+    }
+}
+
+#[cfg(test)]
 mod test_event_processing {
     use super::*;
     use dynamo_kv_router::protocols::{BlockHashOptions, compute_block_hash_for_seq};

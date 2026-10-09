@@ -54,7 +54,14 @@ pub struct ZmqEventNormalizer {
     video_token_id: Option<u32>,
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
-    cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
+    cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct CacheNamespaceEntry {
+    state: CacheNamespaceState,
+    /// Device and host events can own the same external hash independently.
+    storage_tiers: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +265,19 @@ impl ZmqEventNormalizer {
         raw: &mut RawKvEvent,
         worker: WorkerWithDpRank,
     ) -> Result<(), ZmqEventFilterReason> {
+        // Disk/External events bypass namespace propagation in preprocessing.
+        // A missing medium is the legacy device event contract.
+        let storage_tier = match raw
+            .medium()
+            .and_then(StorageTier::from_kv_medium)
+            .unwrap_or_default()
+        {
+            StorageTier::Device => 1,
+            StorageTier::HostPinned => 2,
+            StorageTier::Disk | StorageTier::External => {
+                unreachable!("hash-only lower tiers bypass namespace propagation")
+            }
+        };
         match raw {
             RawKvEvent::BlockStored {
                 block_hashes,
@@ -274,7 +294,7 @@ impl ZmqEventNormalizer {
                         .and_then(|parent| {
                             self.cache_namespaces.get(&(worker, (*parent).into_u64()))
                         })
-                        .and_then(|state| match state {
+                        .and_then(|entry| match &entry.state {
                             CacheNamespaceState::Namespaced(parent_namespace)
                                 if parent_namespace.as_ref() == namespace =>
                             {
@@ -284,7 +304,11 @@ impl ZmqEventNormalizer {
                         })
                         .or_else(|| Some(Arc::from(namespace)))
                 } else if let Some(parent) = parent_block_hash.as_ref() {
-                    match self.cache_namespaces.get(&(worker, (*parent).into_u64())) {
+                    match self
+                        .cache_namespaces
+                        .get(&(worker, (*parent).into_u64()))
+                        .map(|entry| &entry.state)
+                    {
                         Some(CacheNamespaceState::Namespaced(namespace)) => {
                             *cache_namespace = Some(namespace.to_string());
                             Some(Arc::clone(namespace))
@@ -313,11 +337,15 @@ impl ZmqEventNormalizer {
                         self.cache_namespaces
                             .entry((worker, (*block_hash).into_u64()))
                             .and_modify(|existing| {
-                                if *existing != state {
-                                    *existing = CacheNamespaceState::Ambiguous;
+                                existing.storage_tiers |= storage_tier;
+                                if existing.state != state {
+                                    existing.state = CacheNamespaceState::Ambiguous;
                                 }
                             })
-                            .or_insert_with(|| state.clone());
+                            .or_insert_with(|| CacheNamespaceEntry {
+                                state: state.clone(),
+                                storage_tiers: storage_tier,
+                            });
                     }
                 } else {
                     // Do not retain every unsalted block. If this hash already
@@ -328,7 +356,8 @@ impl ZmqEventNormalizer {
                             .cache_namespaces
                             .get_mut(&(worker, (*block_hash).into_u64()))
                         {
-                            *existing = CacheNamespaceState::Ambiguous;
+                            existing.storage_tiers |= storage_tier;
+                            existing.state = CacheNamespaceState::Ambiguous;
                         }
                     }
                 }
@@ -336,10 +365,14 @@ impl ZmqEventNormalizer {
             RawKvEvent::BlockRemoved { block_hashes, .. } => {
                 for block_hash in block_hashes.iter() {
                     let key = (worker, (*block_hash).into_u64());
-                    if !matches!(
-                        self.cache_namespaces.get(&key),
-                        Some(CacheNamespaceState::Ambiguous)
-                    ) {
+                    let remove = self.cache_namespaces.get_mut(&key).is_some_and(|entry| {
+                        entry.storage_tiers &= !storage_tier;
+                        // Preserve the existing fail-closed lifetime of ambiguous
+                        // hashes: one remove cannot disambiguate conflicting stores.
+                        entry.storage_tiers == 0
+                            && !matches!(entry.state, CacheNamespaceState::Ambiguous)
+                    });
+                    if remove {
                         self.cache_namespaces.remove(&key);
                     }
                 }

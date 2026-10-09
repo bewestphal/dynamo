@@ -851,12 +851,12 @@ fn test_normalizer_propagates_cache_namespace_from_parent() {
     let child = normalizer.preprocess(child, worker).unwrap();
 
     let CacheNamespaceState::Namespaced(parent_namespace) =
-        &normalizer.cache_namespaces[&(worker, 1)]
+        &normalizer.cache_namespaces[&(worker, 1)].state
     else {
         panic!("expected namespaced parent");
     };
     let CacheNamespaceState::Namespaced(child_namespace) =
-        &normalizer.cache_namespaces[&(worker, 2)]
+        &normalizer.cache_namespaces[&(worker, 2)].state
     else {
         panic!("expected namespaced child");
     };
@@ -895,10 +895,12 @@ fn test_normalizer_shares_cache_namespace_across_blocks() {
 
     assert!(normalizer.preprocess(event, worker).is_some());
 
-    let CacheNamespaceState::Namespaced(first) = &normalizer.cache_namespaces[&(worker, 1)] else {
+    let CacheNamespaceState::Namespaced(first) = &normalizer.cache_namespaces[&(worker, 1)].state
+    else {
         panic!("expected first block namespace");
     };
-    let CacheNamespaceState::Namespaced(second) = &normalizer.cache_namespaces[&(worker, 2)] else {
+    let CacheNamespaceState::Namespaced(second) = &normalizer.cache_namespaces[&(worker, 2)].state
+    else {
         panic!("expected second block namespace");
     };
     assert!(Arc::ptr_eq(first, second));
@@ -1536,6 +1538,229 @@ fn namespaced_block_stored(
     }
 }
 
+fn namespaced_block_removed(block_hash: u64, medium: Option<&str>) -> RawKvEvent {
+    RawKvEvent::BlockRemoved {
+        block_hashes: vec![BlockHashValue::Unsigned(block_hash)],
+        medium: medium.map(str::to_owned),
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_retained_cpu_namespace_keeps_root_lookup_and_recovery() {
+    use crate::indexer::{
+        KvIndexerInterface, LowerTierIndexers, LowerTierQueryOptions, MatchDetails,
+        query_lower_tiers_with_options,
+    };
+
+    let worker = WorkerWithDpRank::new(7, 0);
+    for namespace in [None, Some("tenant-a")] {
+        for gpu_medium in [None, Some("GPU"), Some("DEVICE")] {
+            let mut normalizer = ZmqEventNormalizer::new(2);
+            let indexers = LowerTierIndexers::new(1, 2);
+            let cpu = indexers.get_or_create(StorageTier::HostPinned);
+            if gpu_medium.is_some() {
+                // Duplicate stores are idempotent residency, not reference counts.
+                for _ in 0..2 {
+                    normalizer
+                        .preprocess(namespaced_block_stored(1, None, namespace, "GPU"), worker)
+                        .unwrap();
+                }
+            }
+            let root = normalizer
+                .normalize(
+                    namespaced_block_stored(1, None, namespace, "CPU"),
+                    1,
+                    worker,
+                )
+                .unwrap()
+                .into_router_event()
+                .unwrap();
+            cpu.apply_event_and_wait(root).await.unwrap();
+            normalizer
+                .preprocess(namespaced_block_removed(1, gpu_medium), worker)
+                .unwrap();
+            let mut child = namespaced_block_stored(2, Some(1), None, "CPU_PINNED");
+            if let RawKvEvent::BlockStored { token_ids, .. } = &mut child {
+                *token_ids = vec![12, 13];
+            }
+            let child = normalizer
+                .normalize(child, 2, worker)
+                .unwrap()
+                .into_router_event()
+                .unwrap();
+            cpu.apply_event_and_wait(child).await.unwrap();
+
+            let sequence = compute_block_hash_for_seq(
+                &[10, 11, 12, 13],
+                2,
+                BlockHashOptions {
+                    cache_namespace: namespace,
+                    ..Default::default()
+                },
+            );
+            let lookup = query_lower_tiers_with_options(
+                &indexers,
+                &sequence,
+                &MatchDetails::default(),
+                LowerTierQueryOptions::default(),
+            );
+            assert_eq!(lookup[&StorageTier::HostPinned].hits[&worker], 2);
+
+            let recovered = LowerTierIndexers::new(1, 2);
+            let recovered_cpu = recovered.get_or_create(StorageTier::HostPinned);
+            for mut event in cpu.dump_events().await.unwrap() {
+                event.storage_tier = StorageTier::HostPinned;
+                recovered_cpu.apply_event_and_wait(event).await.unwrap();
+            }
+            let lookup = query_lower_tiers_with_options(
+                &recovered,
+                &sequence,
+                &MatchDetails::default(),
+                LowerTierQueryOptions::default(),
+            );
+            assert_eq!(lookup[&StorageTier::HostPinned].hits[&worker], 2);
+
+            let other_namespace = compute_block_hash_for_seq(
+                &[10, 11, 12, 13],
+                2,
+                BlockHashOptions {
+                    cache_namespace: Some("tenant-b"),
+                    ..Default::default()
+                },
+            );
+            let lookup = query_lower_tiers_with_options(
+                &indexers,
+                &other_namespace,
+                &MatchDetails::default(),
+                LowerTierQueryOptions::default(),
+            );
+            assert!(!lookup[&StorageTier::HostPinned].hits.contains_key(&worker));
+        }
+    }
+}
+
+#[test]
+fn test_normalizer_namespace_last_tier_removal_cleans_up_and_allows_reuse() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    for remove_order in [["GPU", "CPU"], ["CPU_PINNED", "DEVICE"]] {
+        let mut normalizer = ZmqEventNormalizer::new(2);
+        for medium in ["GPU", "CPU"] {
+            normalizer
+                .preprocess(
+                    namespaced_block_stored(1, None, Some("tenant-a"), medium),
+                    worker,
+                )
+                .unwrap();
+        }
+        normalizer
+            .preprocess(namespaced_block_removed(1, Some(remove_order[0])), worker)
+            .unwrap();
+        assert!(normalizer.cache_namespaces.contains_key(&(worker, 1)));
+        let surviving_medium = if remove_order[0] == "GPU" {
+            "CPU"
+        } else {
+            "GPU"
+        };
+        let child = normalizer
+            .preprocess(
+                namespaced_block_stored(2, Some(1), None, surviving_medium),
+                worker,
+            )
+            .unwrap();
+        assert!(
+            matches!(child, RawKvEvent::BlockStored { cache_namespace: Some(ref ns), .. } if ns == "tenant-a")
+        );
+        normalizer
+            .preprocess(namespaced_block_removed(1, Some(remove_order[1])), worker)
+            .unwrap();
+        assert!(!normalizer.cache_namespaces.contains_key(&(worker, 1)));
+        normalizer
+            .preprocess(
+                namespaced_block_stored(1, None, Some("tenant-b"), "CPU"),
+                worker,
+            )
+            .unwrap();
+        let child = normalizer
+            .preprocess(namespaced_block_stored(3, Some(1), None, "CPU"), worker)
+            .unwrap();
+        assert!(
+            matches!(child, RawKvEvent::BlockStored { cache_namespace: Some(ref ns), .. } if ns == "tenant-b")
+        );
+    }
+}
+
+#[test]
+fn test_normalizer_namespace_removed_child_reinherits_retained_parent() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    normalizer
+        .preprocess(
+            namespaced_block_stored(1, None, Some("tenant-a"), "CPU"),
+            worker,
+        )
+        .unwrap();
+    normalizer
+        .preprocess(namespaced_block_stored(2, Some(1), None, "CPU"), worker)
+        .unwrap();
+    normalizer
+        .preprocess(namespaced_block_removed(2, Some("CPU")), worker)
+        .unwrap();
+    assert!(!normalizer.cache_namespaces.contains_key(&(worker, 2)));
+    let child = normalizer
+        .preprocess(namespaced_block_stored(2, Some(1), None, "CPU"), worker)
+        .unwrap();
+    assert!(
+        matches!(child, RawKvEvent::BlockStored { cache_namespace: Some(ref ns), .. } if ns == "tenant-a")
+    );
+}
+
+#[test]
+fn test_normalizer_namespace_ambiguity_stays_closed_and_clear_is_worker_scoped() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let other = WorkerWithDpRank::new(8, 0);
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    for (medium, namespace) in [("GPU", "tenant-a"), ("CPU", "tenant-b")] {
+        normalizer
+            .preprocess(
+                namespaced_block_stored(1, None, Some(namespace), medium),
+                worker,
+            )
+            .unwrap();
+    }
+    for medium in ["GPU", "CPU"] {
+        normalizer
+            .preprocess(namespaced_block_removed(1, Some(medium)), worker)
+            .unwrap();
+    }
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(namespaced_block_stored(2, Some(1), None, "CPU"), worker)
+            .unwrap_err(),
+        ZmqEventFilterReason::AmbiguousCacheNamespace
+    );
+    normalizer
+        .preprocess(
+            namespaced_block_stored(1, None, Some("tenant-b"), "CPU"),
+            other,
+        )
+        .unwrap();
+    normalizer
+        .preprocess(RawKvEvent::AllBlocksCleared { ownership: None }, worker)
+        .unwrap();
+    assert!(!normalizer.cache_namespaces.contains_key(&(worker, 1)));
+    let child = normalizer
+        .preprocess(namespaced_block_stored(2, Some(1), None, "CPU"), other)
+        .unwrap();
+    assert!(
+        matches!(child, RawKvEvent::BlockStored { cache_namespace: Some(ref ns), .. } if ns == "tenant-b")
+    );
+}
+
 /// A lower-tier STORAGE event must not mutate normalizer state: it may not flip
 /// a Namespaced GPU hash to Ambiguous, and a salted GPU chain continuation must
 /// keep inheriting the parent namespace. This is the device-only preprocess
@@ -1552,7 +1777,7 @@ fn test_lower_tier_events_do_not_pollute_cache_namespace_state() {
     let storage_same_hash = namespaced_block_stored(1, None, None, "STORAGE");
     assert!(normalizer.preprocess(storage_same_hash, worker).is_some());
     assert!(matches!(
-        &normalizer.cache_namespaces[&(worker, 1)],
+        &normalizer.cache_namespaces[&(worker, 1)].state,
         CacheNamespaceState::Namespaced(ns) if ns.as_ref() == "tenant-a"
     ));
 
@@ -1609,7 +1834,7 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
         ZmqEventFilterReason::UnknownMedium
     );
     assert!(matches!(
-        &normalizer.cache_namespaces[&(worker, 1)],
+        &normalizer.cache_namespaces[&(worker, 1)].state,
         CacheNamespaceState::Namespaced(ns) if ns.as_ref() == "tenant-a"
     ));
 

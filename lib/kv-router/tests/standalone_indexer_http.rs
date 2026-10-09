@@ -5,10 +5,9 @@
 //!
 //! Patterned after `lib/llm/tests/http-service.rs`: bind a random port, spawn
 //! `axum::serve` in a background tokio task, poll `/health` until ready, then
-//! drive `reqwest` against the live service. Tests bypass the ZMQ listener
-//! path and pre-populate the `WorkerRegistry`'s `Indexer` directly via
-//! `apply_event_routed`, so they exercise the HTTP layer end-to-end without
-//! requiring a running ZMQ publisher.
+//! drive `reqwest` against the live service. Most tests pre-populate the
+//! `WorkerRegistry`'s `Indexer` directly via `apply_event_routed`; wire tests
+//! publish MessagePack events through a real ZMQ listener before querying HTTP.
 
 #![cfg(feature = "standalone-indexer")]
 
@@ -589,6 +588,127 @@ fn send_live_message(pub_socket: &zmq::Socket, seq: u64, payload: &[u8]) {
             0, // no flags
         )
         .expect("send_multipart");
+}
+
+/// Exercise namespace retention through the real wire listener and HTTP query,
+/// rather than invoking the normalizer directly. No model or physical KV exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zmq_namespace_lifetime_preserves_cpu_prefix_after_gpu_remove() {
+    for salt in [None, Some("tenant-a")] {
+        let registry = Arc::new(WorkerRegistry::new(1));
+        registry.signal_ready();
+        let (base_url, cancel, task) = spawn_indexer_http(make_app_state(registry)).await;
+        let client = reqwest::Client::new();
+        let endpoint = reserve_zmq_endpoint();
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::PUB).unwrap();
+        publisher.set_linger(0).unwrap();
+        publisher.bind(&endpoint).unwrap();
+        let registered = client
+            .post(format!("{base_url}/register"))
+            .json(&json!({"instance_id": 7, "endpoint": endpoint,
+                "model_name": "lifetime-test", "routing_group": "default",
+                "block_size": 4, "dp_rank": 0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), reqwest::StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let mut seq = 0;
+        // CPU and device stores deliberately share the engine's root hash.
+        for medium in ["GPU", "CPU_PINNED"] {
+            let mut root = raw_block_stored(101, None, vec![10, 11, 12, 13], 4, medium);
+            if let RawKvEvent::BlockStored {
+                cache_namespace, ..
+            } = &mut root
+            {
+                *cache_namespace = salt.map(str::to_owned);
+            }
+            send_live_message(&publisher, seq, &encode_batch(root, 0));
+            seq += 1;
+        }
+        let query = json!({"token_ids": [10, 11, 12, 13, 20, 21, 22, 23],
+            "model_name": "lifetime-test", "cache_salt": salt});
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let response: serde_json::Value = client
+                .post(format!("{base_url}/query"))
+                .json(&query)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if response["instances"]["7"]["gpu"] == 4 && response["instances"]["7"]["cpu"] == 4 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "initial stores did not converge: {response}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let remove = RawKvEvent::BlockRemoved {
+            block_hashes: vec![BlockHashValue::Unsigned(101)],
+            medium: Some("GPU".into()),
+            group_idx: None,
+            kv_cache_spec_kind: None,
+            kv_cache_spec_sliding_window: None,
+            locality: None,
+            ownership: None,
+        };
+        send_live_message(&publisher, seq, &encode_batch(remove, 0));
+        seq += 1;
+        // Child carries no salt: its identity must propagate from retained root.
+        let child = raw_block_stored(102, Some(101), vec![20, 21, 22, 23], 4, "CPU_PINNED");
+        send_live_message(&publisher, seq, &encode_batch(child, 0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let observed = loop {
+            let response: serde_json::Value = client
+                .post(format!("{base_url}/query"))
+                .json(&query)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if (response["instances"]["7"]["gpu"] == 0 && response["instances"]["7"]["cpu"] == 8)
+                || tokio::time::Instant::now() >= deadline
+            {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let wrong_salt: serde_json::Value = client
+            .post(format!("{base_url}/query"))
+            .json(&json!({"token_ids": [10, 11, 12, 13, 20, 21, 22, 23],
+                "model_name": "lifetime-test", "cache_salt": "tenant-b"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        println!(
+            "NAMESPACE_WIRE_PROOF salt={salt:?} after_gpu_remove={observed} wrong_salt={wrong_salt}"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+        drop(publisher);
+        assert_eq!(observed["instances"]["7"]["gpu"], 0);
+        assert_eq!(
+            observed["instances"]["7"]["cpu"], 8,
+            "CPU child must inherit retained root namespace: {observed}"
+        );
+        assert_eq!(
+            wrong_salt["instances"]["7"]["cpu"].as_u64().unwrap_or(0),
+            0,
+            "unrelated namespace must not match: {wrong_salt}"
+        );
+    }
 }
 
 /// Poll `/query` against `(model, routing group)` until `instances[instance_id].cpu`
